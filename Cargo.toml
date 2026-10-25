@@ -1,0 +1,24 @@
+[package]
+name = "agent-wiki-rs"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+authors = ["Chris Reynolds"]
+description = "A dependency-free, light-only Markdown wiki with HTTP, MCP and CLI interfaces."
+repository = "https://github.com/dispatchlabs-ai/agent-wiki-rs"
+autotests = false
+autobenches = false
+autoexamples = false
+
+[[bin]]
+name = "agent-wiki"
+path = "src/main.rs"
+test = false
+bench = false
+doc = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
