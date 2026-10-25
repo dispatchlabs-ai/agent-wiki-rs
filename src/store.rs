@@ -427,6 +427,42 @@ impl Store {
         copy_tree(&self.root, destination)
     }
     pub fn verify_files(&self) -> Result<()> {
+        if fs::read_to_string(self.root.join("format"))? != "agent-wiki-rs:1\n" {
+            return Err(Error::new(
+                503,
+                "INTEGRITY_ERROR",
+                "Store format changed while serving",
+            ));
+        }
+        let mut head = fs::read_to_string(self.root.join("HEAD"))?
+            .trim()
+            .to_string();
+        let mut seen = BTreeSet::new();
+        // A concurrent save may advance HEAD after this read snapshot was taken.
+        // Accept a verified descendant, never a rollback or an unrelated chain.
+        while head != self.head {
+            if !hash_id(&head) || !seen.insert(head.clone()) {
+                return Err(Error::new(
+                    503,
+                    "INTEGRITY_ERROR",
+                    "Journal HEAD no longer extends the serving revision",
+                ));
+            }
+            let bytes = fs::read(self.root.join("commits").join(format!("{head}.json")))?;
+            if sha256(&bytes) != head {
+                return Err(Error::new(
+                    503,
+                    "INTEGRITY_ERROR",
+                    "Journal HEAD checksum mismatch",
+                ));
+            }
+            let commit = parse(std::str::from_utf8(&bytes).map_err(|e| invalid(e.to_string()))?)?;
+            head = commit
+                .get("parent")
+                .string()
+                .ok_or_else(|| invalid("Journal parent must be a revision string"))?
+                .to_string();
+        }
         for commit in self.receipts.values() {
             let key = commit.get("commit").s();
             let bytes = fs::read(self.root.join("commits").join(format!("{key}.json")))?;
