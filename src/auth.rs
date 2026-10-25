@@ -2,6 +2,7 @@ use crate::digest::{random, sha256};
 use crate::json::{Json, object};
 use crate::store::{Error, Result, atomic, hash_id, invalid, load_json, now, text};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Principal {
@@ -34,9 +35,10 @@ impl Principal {
         }
     }
 }
+#[derive(Clone)]
 pub struct Auth {
     path: PathBuf,
-    data: Json,
+    data: Arc<Json>,
     fenced: bool,
 }
 impl Auth {
@@ -53,6 +55,7 @@ impl Auth {
                 || !["reader", "editor", "manager"].contains(&c.get("role").s())
                 || !matches!(c.get("revoked"), Json::Bool(_))
                 || !matches!(c.get("scopes"), Json::Array(_))
+                || (c.has("expires_at") && c.get("expires_at").number().is_none())
                 || c.get("scopes")
                     .array()
                     .iter()
@@ -61,9 +64,22 @@ impl Auth {
                 return Err(invalid("Corrupt credential record"));
             }
         }
+        for session in data.get("sessions").array() {
+            if !hash_id(session.get("hash").s())
+                || !hash_id(session.get("csrf").s())
+                || session.get("expires").number().is_none()
+                || !data
+                    .get("credentials")
+                    .array()
+                    .iter()
+                    .any(|c| c.get("id") == session.get("credential"))
+            {
+                return Err(invalid("Corrupt session record"));
+            }
+        }
         Ok(Self {
             path,
-            data,
+            data: Arc::new(data),
             fenced: false,
         })
     }
@@ -77,11 +93,20 @@ impl Auth {
         }
         self.fenced = true;
         atomic(&self.path, next.encode().as_bytes())?;
-        self.data = next;
+        self.data = Arc::new(next);
         self.fenced = false;
         Ok(())
     }
     pub fn grant(&mut self, name: &str, role: &str, scopes: &[String]) -> Result<Json> {
+        self.issue(name, role, scopes, None)
+    }
+    fn issue(
+        &mut self,
+        name: &str,
+        role: &str,
+        scopes: &[String],
+        expiry: Option<usize>,
+    ) -> Result<Json> {
         if name.trim().is_empty()
             || name.len() > 200
             || !["reader", "editor", "manager"].contains(&role)
@@ -107,7 +132,7 @@ impl Auth {
         }
         let token = random()?;
         let key = sha256(token.as_bytes());
-        let credential = object([
+        let mut credential = object([
             ("id", key.clone().into()),
             ("name", name.into()),
             ("role", role.into()),
@@ -122,7 +147,10 @@ impl Auth {
             ("created_at", now().into()),
             ("revoked", false.into()),
         ]);
-        let mut next = self.data.clone();
+        if let Some(expiry) = expiry {
+            credential.insert("expires_at", expiry.into());
+        }
+        let mut next = (*self.data).clone();
         let mut credentials = next.get("credentials").array().to_vec();
         credentials.push(credential.clone());
         next.insert("credentials", credentials.into());
@@ -169,7 +197,13 @@ impl Auth {
             .get("credentials")
             .array()
             .iter()
-            .find(|c| c.get("id").s() == key && !c.get("revoked").boolean())
+            .find(|c| {
+                c.get("id").s() == key
+                    && !c.get("revoked").boolean()
+                    && c.get("expires_at")
+                        .number()
+                        .is_none_or(|expiry| expiry as u64 > now())
+            })
             .ok_or_else(|| Error::new(401, "UNAUTHORIZED", "Credential expired or revoked"))?;
         Ok(Principal {
             id: key,
@@ -189,7 +223,7 @@ impl Auth {
         let who = self.authorize(token, false)?;
         let secret = random()?;
         let csrf = random()?;
-        let mut next = self.data.clone();
+        let mut next = (*self.data).clone();
         let mut sessions = next
             .get("sessions")
             .array()
@@ -209,7 +243,7 @@ impl Auth {
     }
     pub fn logout(&mut self, secret: &str) -> Result<()> {
         let hash = sha256(secret.as_bytes());
-        let mut next = self.data.clone();
+        let mut next = (*self.data).clone();
         next.insert(
             "sessions",
             next.get("sessions")
@@ -226,7 +260,7 @@ impl Auth {
         self.data.get("credentials").clone()
     }
     pub fn revoke(&mut self, key: &str) -> Result<()> {
-        let mut next = self.data.clone();
+        let mut next = (*self.data).clone();
         let mut found = false;
         let credentials = next
             .get("credentials")
@@ -248,16 +282,75 @@ impl Auth {
         self.persist(next)
     }
     pub fn grant_input(&mut self, input: &Json) -> Result<Json> {
+        if input.has("expires_at")
+            && input
+                .get("expires_at")
+                .number()
+                .is_none_or(|n| n as u64 <= now())
+        {
+            return Err(invalid("expires_at must be a future Unix timestamp"));
+        }
         let scopes = input
             .get("scopes")
             .array()
             .iter()
             .map(|s| s.s().into())
             .collect::<Vec<_>>();
-        self.grant(text(input, "name", 200)?, text(input, "role", 20)?, &scopes)
+        self.issue(
+            text(input, "name", 200)?,
+            text(input, "role", 20)?,
+            &scopes,
+            input.get("expires_at").number(),
+        )
     }
-    pub fn reset_after_restore(&mut self) -> Result<()> {
-        let mut next = self.data.clone();
+
+    pub fn change(&mut self, input: &Json) -> Result<Json> {
+        let key = text(input, "id", 64)?;
+        let role = text(input, "role", 20)?;
+        let scopes = input.get("scopes").array();
+        if !["reader", "editor", "manager"].contains(&role)
+            || !matches!(input.get("scopes"), Json::Array(_))
+            || !scopes.iter().any(|s| s.s() == "read")
+            || scopes.iter().any(|s| {
+                !["read", "write", "trace", "manage"].contains(&s.s())
+                    || (role == "reader" && s.s() != "read")
+                    || (role != "manager" && s.s() == "manage")
+            })
+        {
+            return Err(invalid("Invalid role and scopes"));
+        }
+        if input.has("expires_at")
+            && input
+                .get("expires_at")
+                .number()
+                .is_none_or(|n| n as u64 <= now())
+        {
+            return Err(invalid("expires_at must be a future Unix timestamp"));
+        }
+        let mut next = (*self.data).clone();
+        let mut records = next.get("credentials").array().to_vec();
+        let credential = records
+            .iter_mut()
+            .find(|c| c.get("id").s() == key && !c.get("revoked").boolean())
+            .ok_or_else(|| {
+                Error::new(
+                    404,
+                    "NOT_FOUND",
+                    "Active credential not found; revoked credentials cannot be revived",
+                )
+            })?;
+        credential.insert("role", role.into());
+        credential.insert("scopes", input.get("scopes").clone());
+        if input.has("expires_at") {
+            credential.insert("expires_at", input.get("expires_at").clone());
+        }
+        let result = credential.clone();
+        next.insert("credentials", records.into());
+        self.persist(next)?;
+        Ok(result)
+    }
+    pub fn reset_after_restore(&mut self, revoke_credentials: bool) -> Result<()> {
+        let mut next = (*self.data).clone();
         next.insert("sessions", Vec::new().into());
         next.insert(
             "credentials",
@@ -266,7 +359,9 @@ impl Auth {
                 .iter()
                 .map(|c| {
                     let mut c = c.clone();
-                    c.insert("revoked", true.into());
+                    if revoke_credentials {
+                        c.insert("revoked", true.into());
+                    }
                     c
                 })
                 .collect::<Vec<_>>()

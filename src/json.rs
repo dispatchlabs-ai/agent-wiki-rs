@@ -258,6 +258,9 @@ impl Parser<'_> {
             .s
             .get(self.i..self.i + 4)
             .ok_or("Incomplete JSON escape")?;
+        if !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return Err("Invalid JSON escape".into());
+        }
         let s = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
         let n = u32::from_str_radix(s, 16).map_err(|_| "Invalid JSON escape")?;
         self.i += 4;

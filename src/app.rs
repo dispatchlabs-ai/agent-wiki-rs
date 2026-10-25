@@ -6,6 +6,7 @@ use crate::store::{Error, Result, Store, invalid, text};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct App {
     pub store: Store,
     pub auth: Auth,
@@ -75,15 +76,21 @@ impl App {
         }
         validate(input, &definition.schema)?;
         match name {
-            "wiki.health" => Ok(object([
-                ("status", "ready".into()),
-                ("version", env!("CARGO_PKG_VERSION").into()),
-                ("articles", self.store.pages.len().into()),
-                ("head", self.store.head.clone().into()),
-                ("conversations", self.conversations.into()),
-                ("writes", self.writes.into()),
-                ("storage", "local-journal-v1".into()),
-            ])),
+            "wiki.health" => {
+                self.store.verify_files()?;
+                Auth::open(&self.store.root)?;
+                let verified = evidence::verify_all(&self.store.root, self.conversations)?;
+                Ok(object([
+                    ("status", "ready".into()),
+                    ("version", env!("CARGO_PKG_VERSION").into()),
+                    ("articles", self.store.pages.len().into()),
+                    ("head", self.store.head.clone().into()),
+                    ("conversations", self.conversations.into()),
+                    ("writes", self.writes.into()),
+                    ("storage", "local-journal-v1".into()),
+                    ("integrity", verified),
+                ]))
+            }
             "wiki.list" => {
                 let (offset, limit) = pagination(input)?;
                 let topic = input.get("topic").s();
@@ -253,7 +260,26 @@ impl App {
                 "html",
                 markdown::render(text(input, "body", 100000)?).into(),
             )])),
-            "wiki.save" => self.store.save(&who.id, &who.name, input),
+            "wiki.save" => {
+                let retry = format!("{}:{}", who.id, input.get("operation_id").s());
+                if !self.store.receipts.contains_key(&retry)
+                    && input
+                        .get("updates")
+                        .array()
+                        .iter()
+                        .any(|u| !u.get("evidence").array().is_empty())
+                {
+                    who.require("trace")?;
+                    if !self.conversations {
+                        return Err(Error::new(
+                            503,
+                            "EVIDENCE_UNAVAILABLE",
+                            "Original evidence is disabled; existing quotations may be preserved or cleared",
+                        ));
+                    }
+                }
+                self.store.save(&who.id, &who.name, input)
+            }
             "wiki.traceSearch" => {
                 let (offset, limit) = pagination(input)?;
                 evidence::search(&self.store.root, text(input, "q", 1000)?, offset, limit)
@@ -266,10 +292,16 @@ impl App {
                     offset,
                     limit,
                     input.get("kind").s() == "raw",
+                    (
+                        input.get("text_offset").number().unwrap_or(0),
+                        input.get("text_limit").number().unwrap_or(16000),
+                    ),
                 )
             }
+            "wiki.attachment" => evidence::attachment_window(&self.store.root, input),
             "wiki.credentials" => Ok(self.auth.list()),
             "wiki.grant" => self.auth.grant_input(input),
+            "wiki.changeAccess" => self.auth.change(input),
             "wiki.revoke" => {
                 self.auth.revoke(text(input, "id", 64)?)?;
                 Ok(object([("revoked", true.into())]))
@@ -356,6 +388,23 @@ pub fn definitions() -> Vec<Definition> {
             ("sources", object([("type", "array".into())])),
             ("kind", string()),
             ("aliases", strings()),
+            (
+                "evidence",
+                object([
+                    ("type", "array".into()),
+                    (
+                        "items",
+                        schema(
+                            vec![
+                                ("conversation", string()),
+                                ("event", string()),
+                                ("quote", string()),
+                            ],
+                            &["conversation", "event", "quote"],
+                        ),
+                    ),
+                ]),
+            ),
         ],
         &["id", "expected_revision_id", "summary"],
     );
@@ -453,7 +502,7 @@ pub fn definitions() -> Vec<Definition> {
         },
         Definition {
             name: "wiki.trace",
-            description: "Read imported JSONL progressively. offset is an original line offset. kind raw includes recorded tools and reasoning; default dialogue excludes them.",
+            description: "Read verified original JSONL progressively. offset is a physical line offset; text_offset/text_limit window a large record in Unicode characters. Resume with nextOffset and nextTextOffset. kind raw includes tools/reasoning; default dialogue excludes them.",
             action: "trace",
             evidence: true,
             schema: schema(
@@ -466,10 +515,27 @@ pub fn definitions() -> Vec<Definition> {
                             ("enum", vec!["dialogue".into(), "raw".into()].into()),
                         ]),
                     ),
+                    ("text_offset", integer()),
+                    ("text_limit", integer()),
                     ("offset", integer()),
                     ("limit", integer()),
                 ],
                 &["id"],
+            ),
+        },
+        Definition {
+            name: "wiki.attachment",
+            description: "Read a captured attachment in exact base64 byte windows. Original trace permission is required; nextOffset continues the file. This does not publish the file to article readers.",
+            action: "trace",
+            evidence: true,
+            schema: schema(
+                vec![
+                    ("id", string()),
+                    ("sha256", string()),
+                    ("offset", integer()),
+                    ("limit", integer()),
+                ],
+                &["id", "sha256"],
             ),
         },
         Definition {
@@ -489,8 +555,24 @@ pub fn definitions() -> Vec<Definition> {
                     ("name", string()),
                     ("role", string()),
                     ("scopes", strings()),
+                    ("expires_at", integer()),
                 ],
                 &["name", "role", "scopes"],
+            ),
+        },
+        Definition {
+            name: "wiki.changeAccess",
+            description: "Change an active credential's role and scopes immediately, optionally setting a future expiry. Revoked credentials cannot be revived. Manager only.",
+            action: "manage",
+            evidence: false,
+            schema: schema(
+                vec![
+                    ("id", string()),
+                    ("role", string()),
+                    ("scopes", strings()),
+                    ("expires_at", integer()),
+                ],
+                &["id", "role", "scopes"],
             ),
         },
         Definition {

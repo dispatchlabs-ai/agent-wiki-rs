@@ -72,11 +72,16 @@ impl Response {
         };
         write!(
             stream,
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: same-origin\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: same-origin\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https:; object-src {}; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\n",
             self.status,
             message,
             self.mime,
-            self.body.len()
+            self.body.len(),
+            if self.mime == "application/pdf" {
+                "'self'"
+            } else {
+                "'none'"
+            }
         )?;
         for (k, v) in self.headers {
             write!(stream, "{k}: {v}\r\n")?;
@@ -109,6 +114,9 @@ pub fn decode(s: &str, form: bool) -> Result<String> {
                     .get(i + 1..i + 3)
                     .ok_or_else(|| invalid("Incomplete URL escape"))?;
                 let h = std::str::from_utf8(h).map_err(|_| invalid("Invalid URL escape"))?;
+                if !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(invalid("Invalid URL escape"));
+                }
                 let b = u8::from_str_radix(h, 16).map_err(|_| invalid("Invalid URL escape"))?;
                 if b == 0 {
                     return Err(invalid("NUL in URL"));
@@ -454,6 +462,62 @@ fn route(shared: &Arc<Mutex<App>>, r: &Request, origin: &str, bind_host: &str) -
     if r.method == "POST" {
         csrf(r, &who, origin, None)?;
     }
+    if let Some(action) = read_action(r)? {
+        who.require(action)?;
+        let mut snapshot = app.clone();
+        drop(app);
+        let result = authenticated(&mut snapshot, &who, r);
+        let current = shared
+            .lock()
+            .map_err(|_| Error::new(500, "STATE_UNAVAILABLE", "Restart after internal failure"))?;
+        current.auth.authorize(&secret, cookie)?.require(action)?;
+        if current.store.fenced {
+            return Err(Error::new(
+                503,
+                "STORE_UNCERTAIN",
+                "Restart to recover an uncertain journal write",
+            ));
+        }
+        return result;
+    }
+    authenticated(&mut app, &who, r)
+}
+fn read_action(r: &Request) -> Result<Option<&'static str>> {
+    if r.method == "GET" {
+        return Ok(Some(
+            if r.path.starts_with("/conversations") || r.path.starts_with("/conversation-files/") {
+                "trace"
+            } else if r.path.starts_with("/access") {
+                "manage"
+            } else if r.path.starts_with("/edit") {
+                "write"
+            } else {
+                "read"
+            },
+        ));
+    }
+    let body = if r.path == "/mcp" {
+        Some(body_json(r)?)
+    } else {
+        None
+    };
+    let name = if let Some(name) = r.path.strip_prefix("/api/tools/") {
+        name
+    } else if let Some(body) = &body {
+        match body.get("method").s() {
+            "initialize" | "ping" | "tools/list" => return Ok(Some("read")),
+            "tools/call" => body.get("params").get("name").s(),
+            _ => return Ok(None),
+        }
+    } else {
+        return Ok(None);
+    };
+    Ok(crate::app::definitions()
+        .into_iter()
+        .find(|d| d.name == name && ["read", "trace"].contains(&d.action))
+        .map(|d| d.action))
+}
+fn authenticated(app: &mut App, who: &Principal, r: &Request) -> Result<Response> {
     if r.path == "/mcp" {
         if r.method != "POST" {
             return Err(Error::new(
@@ -463,7 +527,7 @@ fn route(shared: &Arc<Mutex<App>>, r: &Request, origin: &str, bind_host: &str) -
             ));
         }
         let input = body_json(r)?;
-        let response = rpc(&mut app, &who, &input)?;
+        let response = rpc(app, who, &input)?;
         return Ok(match response {
             Some(v) => Response::json(v),
             None => Response {
@@ -475,7 +539,7 @@ fn route(shared: &Arc<Mutex<App>>, r: &Request, origin: &str, bind_host: &str) -
         });
     }
     if r.path == "/api/tools" && r.method == "GET" {
-        return Ok(Response::json(app.tools(&who)));
+        return Ok(Response::json(app.tools(who)));
     }
     if r.path == "/api/openapi.json" && r.method == "GET" {
         return Ok(Response::json(openapi()));
@@ -488,10 +552,33 @@ fn route(shared: &Arc<Mutex<App>>, r: &Request, origin: &str, bind_host: &str) -
                 "Operations require POST",
             ));
         }
-        return Ok(Response::json(app.call(&who, name, &body_json(r)?)?));
+        return Ok(Response::json(app.call(who, name, &body_json(r)?)?));
     }
     if r.method != "GET" {
         return Err(Error::new(404, "NOT_FOUND", "Route not found"));
+    }
+    if let Some(path) = r.path.strip_prefix("/conversation-files/") {
+        who.require("trace")?;
+        if !app.conversations {
+            return Err(Error::new(
+                404,
+                "CONVERSATIONS_DISABLED",
+                "Conversation access is disabled",
+            ));
+        }
+        let (key, hash) = path
+            .split_once('/')
+            .ok_or_else(|| invalid("Invalid captured file URL"))?;
+        let (_, body) = evidence::attachment(&app.store.root, key, hash)?;
+        return Ok(Response {
+            status: 200,
+            mime: "application/octet-stream",
+            body,
+            headers: vec![(
+                "Content-Disposition".into(),
+                format!("attachment; filename=\"{hash}\""),
+            )],
+        });
     }
     if let Some(name) = r.path.strip_prefix("/article-media/") {
         who.require("read")?;
@@ -513,26 +600,34 @@ fn route(shared: &Arc<Mutex<App>>, r: &Request, origin: &str, bind_host: &str) -
     let q = r.query.get("q").map(String::as_str).unwrap_or("");
     let segments = r.path.trim_matches('/').split('/').collect::<Vec<_>>();
     let body = match segments.as_slice() {
-        [""] => ui::catalog(&mut app, &who, q, offset)?,
-        ["wiki", key] => ui::article(&mut app, &who, key, None)?,
+        [""] => ui::catalog(app, who, q, offset)?,
+        ["wiki", key] => ui::article(app, who, key, None)?,
         ["wiki", key, "revision", n] => ui::article(
-            &mut app,
-            &who,
+            app,
+            who,
             key,
             Some(n.parse().map_err(|_| invalid("Invalid revision"))?),
         )?,
-        ["edit"] => ui::editor(&app, &who, "")?,
-        ["edit", key] => ui::editor(&app, &who, key)?,
-        ["history", key] => ui::history(&mut app, &who, key)?,
-        ["access"] => ui::access(&app, &who)?,
-        ["conversations"] => ui::conversations(&mut app, &who, "", q, offset, false)?,
+        ["edit"] => ui::editor(app, who, "")?,
+        ["edit", key] => ui::editor(app, who, key)?,
+        ["history", key] => ui::history(app, who, key)?,
+        ["access"] => ui::access(app, who)?,
+        ["conversations"] => ui::conversations(app, who, "", q, offset, (false, 0))?,
         ["conversations", key] => ui::conversations(
-            &mut app,
-            &who,
+            app,
+            who,
             key,
             q,
             offset,
-            r.query.get("kind").is_some_and(|s| s == "raw"),
+            (
+                r.query.get("kind").is_some_and(|s| s == "raw"),
+                r.query
+                    .get("text_offset")
+                    .map(|s| s.parse::<usize>())
+                    .transpose()
+                    .map_err(|_| invalid("Invalid text_offset"))?
+                    .unwrap_or(0),
+            ),
         )?,
         _ => return Err(Error::new(404, "NOT_FOUND", "Route not found")),
     };

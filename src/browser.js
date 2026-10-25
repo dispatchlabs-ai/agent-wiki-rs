@@ -38,6 +38,11 @@ if (editor) {
             summary: data.get("summary")
           }]
         };
+        const sources = editor.elements.evidence;
+        if (sources && sources.value !== sources.defaultValue) {
+          try { pending.updates[0].evidence = JSON.parse(sources.value); }
+          catch (error) { pending = null; error.status = 400; throw error; }
+        }
       }
       status.textContent = "Saving…";
       await call("wiki.save", pending);
@@ -79,6 +84,14 @@ document.querySelector("#grant")?.addEventListener("submit", async event => {
     status.textContent = "Credential created. Copy it to private storage before leaving this page.";
   } catch (error) { status.textContent = error.message; }
   finally { button.disabled = false; }
+});
+document.querySelectorAll(".change-role").forEach(button => {
+  button.addEventListener("click", async () => {
+    const role = button.closest("tr").querySelector(".access-role").value;
+    const scopes = role === "reader" ? ["read"] : role === "manager" ? ["read", "write", "trace", "manage"] : ["read", "write", "trace"];
+    try { await call("wiki.changeAccess", { id: button.dataset.id, role, scopes }); location.reload(); }
+    catch (error) { alert(error.message); }
+  });
 });
 document.querySelectorAll(".revoke").forEach(button => {
   button.addEventListener("click", async () => {

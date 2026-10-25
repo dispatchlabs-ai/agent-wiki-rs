@@ -60,8 +60,8 @@ fn inline_depth(s: &str, depth: usize) -> String {
         if let Some(rest) = tail.strip_prefix("[[")
             && let Some(end) = rest.find("]]")
         {
-            let content = &rest[..end];
-            let (target, label) = content.split_once('|').unwrap_or((content, content));
+            let content = rest[..end].replace("\\|", "|");
+            let (target, label) = content.split_once('|').unwrap_or((&content, &content));
             let (page, anchor) = target.split_once('#').unwrap_or((target, ""));
             if crate::store::id(page) && !anchor.contains(['"', '<', '>', ' ']) {
                 out.push_str(&format!(
@@ -239,11 +239,45 @@ pub fn references(body: &str) -> BTreeSet<String> {
 }
 
 fn cells(line: &str) -> Vec<&str> {
-    line.trim()
-        .trim_matches('|')
-        .split('|')
-        .map(str::trim)
-        .collect()
+    let line = line.trim();
+    let bytes = line.as_bytes();
+    let mut cells = Vec::new();
+    let mut start = usize::from(bytes.first() == Some(&b'|'));
+    let mut i = start;
+    let mut brackets = 0usize;
+    let mut code = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && code == 0 {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            let length = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            if code == 0 {
+                code = length;
+            } else if code == length {
+                code = 0;
+            }
+            i += length;
+            continue;
+        }
+        if code == 0 {
+            match bytes[i] {
+                b'[' => brackets += 1,
+                b']' => brackets = brackets.saturating_sub(1),
+                b'|' if brackets == 0 => {
+                    cells.push(line[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if start < line.len() {
+        cells.push(line[start..].trim());
+    }
+    cells
 }
 fn rule(line: &str) -> bool {
     let c = cells(line);

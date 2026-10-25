@@ -87,6 +87,19 @@ pub fn article(
         ));
     }
     body.push_str(&format!("</aside><article><div class=\"article-heading\"><p class=\"eyebrow\">{}</p><h1>{}</h1><p class=\"lead\">{}</p><div class=\"article-actions\"><span>Revision {} · {}</span><a href=\"/history/{key}/\">History</a>{}</div></div><div class=\"prose\">{}</div>",escape(p.get("topic").s()),escape(p.get("title").s()),escape(p.get("description").s()),p.get("number").s_number(),escape(p.get("author").s()),if who.can("write")&&app.writes{format!("<a href=\"/edit/{key}/\">Edit article</a>")}else{String::new()},render(p.get("body").s())));
+    if !p.get("evidence").array().is_empty() {
+        body.push_str("<section class=\"prose\"><h2>Verified sources</h2>");
+        for source in p.get("evidence").array() {
+            body.push_str(&format!(
+                "<blockquote><p>{}</p><p><a href=\"{}\">{} · {}</a></p></blockquote>",
+                escape(source.get("quote").s()),
+                escape(source.get("url").s()),
+                escape(source.get("attribution").s()),
+                escape(source.get("event").s())
+            ));
+        }
+        body.push_str("</section>");
+    }
     if !p.get("backlinks").array().is_empty() {
         body.push_str("<section class=\"backlinks\"><h2>Linked from</h2><ul>");
         for link in p.get("backlinks").array() {
@@ -144,7 +157,20 @@ pub fn editor(app: &App, who: &Principal, key: &str) -> Result<String> {
             }
         ));
     }
-    form.push_str(&format!("</div><input name=\"revision\" type=\"hidden\" value=\"{}\"><label>Markdown<textarea name=\"body\" rows=\"24\" required spellcheck=\"true\">{}</textarea></label><label>Change summary<input name=\"summary\" required maxlength=\"1000\" placeholder=\"What changed, and why?\"></label><div class=\"actions\"><button type=\"submit\">Save article</button><button id=\"preview-button\" type=\"button\" class=\"secondary\">Preview</button><a href=\"/\">Cancel</a></div><p id=\"status\" role=\"status\"></p></form><section id=\"preview\" class=\"prose\" hidden></section>",escape(p.get("revision_id").s()),escape(p.get("body").s())));
+    let quotes = Json::from(
+        p.get("evidence")
+            .array()
+            .iter()
+            .map(|q| {
+                object([
+                    ("conversation", q.get("conversation").clone()),
+                    ("event", q.get("event").clone()),
+                    ("quote", q.get("quote").clone()),
+                ])
+            })
+            .collect::<Vec<_>>(),
+    );
+    form.push_str(&format!("</div><input name=\"revision\" type=\"hidden\" value=\"{}\"><label>Markdown<textarea name=\"body\" rows=\"24\" required spellcheck=\"true\">{}</textarea></label><details><summary>Verify supporting quotations</summary><label>Sources as JSON: conversation, event (line-N), exact quote<textarea name=\"evidence\" rows=\"5\" spellcheck=\"false\">{}</textarea></label><p>Unchanged sources are preserved. An empty array clears them. New quotations require original-evidence access.</p></details><label>Change summary<input name=\"summary\" required maxlength=\"1000\" placeholder=\"What changed, and why?\"></label><div class=\"actions\"><button type=\"submit\">Save article</button><button id=\"preview-button\" type=\"button\" class=\"secondary\">Preview</button><a href=\"/\">Cancel</a></div><p id=\"status\" role=\"status\"></p></form><section id=\"preview\" class=\"prose\" hidden></section>",escape(p.get("revision_id").s()),escape(p.get("body").s()), escape(&quotes.encode())));
     Ok(shell("Edit article", &form, Some(who), app.conversations))
 }
 pub fn history(app: &mut App, who: &Principal, key: &str) -> Result<String> {
@@ -168,7 +194,8 @@ pub fn access(app: &App, who: &Principal) -> Result<String> {
         body.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape(c.get("name").s()),
-            escape(c.get("role").s()),
+            if c.get("revoked").boolean() { escape(c.get("role").s()) }
+            else { format!("<label><span class=\"sr-only\">Role for {}</span><select class=\"access-role\">{}</select></label><button class=\"quiet change-role\" data-id=\"{}\">Set role</button>", escape(c.get("name").s()), ["reader", "editor", "manager"].into_iter().map(|role| format!("<option {}>{role}</option>", if role == c.get("role").s() { "selected" } else { "" })).collect::<String>(), escape(c.get("id").s())) },
             escape(
                 &c.get("scopes")
                     .array()
@@ -201,8 +228,9 @@ pub fn conversations(
     key: &str,
     q: &str,
     offset: usize,
-    raw: bool,
+    view: (bool, usize),
 ) -> Result<String> {
+    let (raw, text_offset) = view;
     let mut body;
     if key.is_empty() {
         let r = app.call(
@@ -242,6 +270,7 @@ pub fn conversations(
                 ("offset", offset.into()),
                 ("limit", 40usize.into()),
                 ("kind", if raw { "raw" } else { "dialogue" }.into()),
+                ("text_offset", text_offset.into()),
             ]),
         )?;
         body = format!(
@@ -254,14 +283,40 @@ pub fn conversations(
                 "Show raw records, including tools and reasoning"
             }
         );
+        let provenance = r.get("provenance");
+        body.push_str(&format!(
+            "<p>Original file: <code>{}</code> · Session: <code>{}</code></p>",
+            escape(provenance.get("source_name").s()),
+            escape(provenance.get("session").s())
+        ));
+        if let Some(parent) = provenance.get("parent").string() {
+            body.push_str(&format!(
+                "<p><a href=\"/conversations/{}/\">Parent snapshot</a></p>",
+                escape(parent)
+            ));
+        }
+        if !r.get("attachments").array().is_empty() {
+            body.push_str("<section><h2>Captured files</h2><ul>");
+            for file in r.get("attachments").array() {
+                body.push_str(&format!(
+                    "<li><a href=\"{}\">{}</a> · {} bytes · line {}</li>",
+                    escape(file.get("url").s()),
+                    escape(file.get("name").s()),
+                    file.get("size").s_number(),
+                    file.get("line").s_number()
+                ));
+            }
+            body.push_str("</ul></section>");
+        }
         for m in r.get("messages").array() {
             let number = m.get("line").s_number();
-            body.push_str(&format!("<section class=\"message\" id=\"line-{number}\"><a href=\"{}\">Line {number}</a><strong>{}</strong><pre>{}</pre></section>",escape(m.get("url").s()),escape(m.get("role").s()),escape(&if raw{m.get("record").encode()}else{m.get("text").s().to_string()})));
+            body.push_str(&format!("<section class=\"message\" id=\"line-{number}\"><a href=\"{}\">Line {number}</a><strong>{}</strong><pre>{}</pre></section>",escape(m.get("url").s()),escape(m.get("role").s()),escape(m.get("text").s())));
         }
         if let Some(n) = r.get("nextOffset").number() {
             body.push_str(&format!(
-                "<a href=\"?offset={n}&amp;kind={}\">Continue →</a>",
-                if raw { "raw" } else { "dialogue" }
+                "<a href=\"?offset={n}&amp;kind={}&amp;text_offset={}\">Continue →</a>",
+                if raw { "raw" } else { "dialogue" },
+                r.get("nextTextOffset").number().unwrap_or(0)
             ));
         }
     }

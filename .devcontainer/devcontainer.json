@@ -1,0 +1,10 @@
+{
+  "name": "Agent Wiki Rust",
+  "image": "rust@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2",
+  "containerEnv": {
+    "CARGO_TARGET_DIR": "/tmp/agent-wiki-target"
+  },
+  "postCreateCommand": "rustup component add rustfmt clippy && cargo build --release --offline --locked",
+  "remoteUser": "root",
+  "shutdownAction": "stopContainer"
+}

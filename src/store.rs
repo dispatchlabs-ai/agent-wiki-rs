@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -150,23 +151,20 @@ pub fn validate_update(u: &Json) -> Result<()> {
         ));
     }
     if u.has("evidence") {
-        return Err(Error::new(
-            422,
-            "NOT_IMPLEMENTED",
-            "Verified evidence quotations are not implemented; no edit was saved",
-        ));
+        crate::evidence::validate_quotes(u.get("evidence"))?;
     }
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct Store {
     pub root: PathBuf,
     pub head: String,
-    pub pages: BTreeMap<String, Json>,
-    pub history: BTreeMap<String, Vec<Json>>,
-    pub receipts: BTreeMap<String, Json>,
+    pub pages: Arc<BTreeMap<String, Json>>,
+    pub history: Arc<BTreeMap<String, Vec<Json>>>,
+    pub receipts: Arc<BTreeMap<String, Json>>,
     pub fenced: bool,
-    _lock: File,
+    _lock: Arc<File>,
 }
 impl Store {
     pub fn init(path: &Path) -> Result<()> {
@@ -208,11 +206,11 @@ impl Store {
         let mut s = Self {
             root,
             head: head.clone(),
-            pages: BTreeMap::new(),
-            history: BTreeMap::new(),
-            receipts: BTreeMap::new(),
+            pages: Arc::new(BTreeMap::new()),
+            history: Arc::new(BTreeMap::new()),
+            receipts: Arc::new(BTreeMap::new()),
             fenced: false,
-            _lock: lock,
+            _lock: Arc::new(lock),
         };
         let mut current = head;
         let mut commits = Vec::new();
@@ -268,7 +266,9 @@ impl Store {
         for update in c.get("updates").array() {
             let mut page = update.clone();
             let key = page.get("id").s().to_string();
-            let history = self.history.entry(key.clone()).or_default();
+            let history = Arc::make_mut(&mut self.history)
+                .entry(key.clone())
+                .or_default();
             page.remove("expected_revision_id");
             page.insert("number", (history.len() + 1).into());
             page.insert("revision_id", commit.into());
@@ -277,12 +277,12 @@ impl Store {
             page.insert("author", c.get("author").clone());
             history.push(page.clone());
             if page.get("deleted").boolean() {
-                self.pages.remove(&key);
+                Arc::make_mut(&mut self.pages).remove(&key);
             } else {
-                self.pages.insert(key, page);
+                Arc::make_mut(&mut self.pages).insert(key, page);
             }
         }
-        self.receipts.insert(
+        Arc::make_mut(&mut self.receipts).insert(
             format!("{}:{}", c.get("actor").s(), c.get("operation_id").s()),
             c.clone(),
         );
@@ -345,6 +345,12 @@ impl Store {
                 for (k, v) in fields {
                     page.insert(k, v.clone());
                 }
+            }
+            if u.has("evidence") {
+                page.insert(
+                    "evidence",
+                    crate::evidence::verify_quotes(&self.root, u.get("evidence"))?,
+                );
             }
             page.insert("deleted", u.get("deleted").boolean().into());
             checked.push(page);
@@ -420,6 +426,20 @@ impl Store {
     pub fn backup(&self, destination: &Path) -> Result<()> {
         copy_tree(&self.root, destination)
     }
+    pub fn verify_files(&self) -> Result<()> {
+        for commit in self.receipts.values() {
+            let key = commit.get("commit").s();
+            let bytes = fs::read(self.root.join("commits").join(format!("{key}.json")))?;
+            if sha256(&bytes) != key {
+                return Err(Error::new(
+                    503,
+                    "INTEGRITY_ERROR",
+                    "Journal checksum mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 impl Json {
     pub fn s_number(&self) -> String {
@@ -433,6 +453,9 @@ pub fn copy_tree(source: &Path, dest: &Path) -> Result<()> {
     }
     fs::create_dir(dest)?;
     fs::set_permissions(dest, fs::Permissions::from_mode(0o700))?;
+    let staging = parent.join(format!(".pending-copy-{}", random()?));
+    fs::create_dir(&staging)?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
     fn copy(source: &Path, dest: &Path) -> Result<()> {
         for e in fs::read_dir(source)? {
             let e = e?;
@@ -461,5 +484,15 @@ pub fn copy_tree(source: &Path, dest: &Path) -> Result<()> {
         }
         sync_dir(dest)
     }
-    copy(source, dest)
+    let result = (|| {
+        copy(source, &staging)?;
+        fs::rename(&staging, dest)?;
+        sync_dir(&parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+        // Only remove the empty reservation. Never remove a published backup.
+        let _ = fs::remove_dir(dest);
+    }
+    result
 }

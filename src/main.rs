@@ -20,11 +20,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use store::{Error, Result, Store, invalid, private_file};
 
-const HELP: &str = r#"agent-wiki 0.1.0-alpha.1
+const HELP: &str = r#"agent-wiki 0.1.0-alpha.2
 Created by Chris Reynolds, cofounder of Dispatch Labs AI.
 Dependency-free Rust wiki. Light-only UI. No Git, Node or helper executables.
 
 agent-wiki init --data DIR --token-file FILE
+agent-wiki demo --data NEW_DIR --token-file FILE
 agent-wiki serve --data DIR [--listen 127.0.0.1:8080] [--origin ORIGIN]
                  [--read-only] [--no-conversations]
 agent-wiki call TOOL [JSON | @FILE | -] --token-file FILE
@@ -39,10 +40,11 @@ agent-wiki retire --data DIR --id ARTICLE_ID --revision REVISION_ID
                   --summary REASON
 agent-wiki import --data DIR --directory MARKDOWN_DIR
 agent-wiki export --data DIR --directory NEW_DIR
-agent-wiki import-trace --data DIR --file JSONL --title TITLE
+agent-wiki import-trace --data DIR --file JSONL --title TITLE [--session ID] [--parent TRACE_ID]
+agent-wiki capture-file --data DIR --trace TRACE_ID --line N --file FILE
 agent-wiki publish-media --data DIR --file FILE --source PROVENANCE
 agent-wiki backup --data DIR --to NEW_DIR
-agent-wiki restore --from BACKUP --data NEW_DIR --token-file FILE
+agent-wiki restore --from BACKUP --data NEW_DIR --token-file FILE [--revoke-credentials]
 agent-wiki verify --data DIR
 
 init refuses existing directories and token files. Keep credentials private.
@@ -58,7 +60,9 @@ Markdown only; it does not migrate old revisions, users, receipts or citations.
 Imports accept JSON frontmatter and a strict simple-YAML subset; unsupported
 YAML is rejected. Complex diagrams and mathematics remain source text.
 backup copies durable state while the service is stopped. restore verifies
-the journal, revokes restored credentials/sessions and issues a new manager.
+all evidence/media and the journal, ends sessions and issues a new manager.
+Identity credentials survive unless --revoke-credentials is supplied.
+An interrupted Markdown import resumes only with the exact original input.
 This is a source alpha, not a drop-in replacement for existing Agent Wiki.
 "#;
 
@@ -75,13 +79,19 @@ impl Args {
         let mut positional = Vec::new();
         while let Some(arg) = iter.next() {
             if arg.starts_with("--") {
-                let value =
-                    if ["--help", "--read-only", "--no-conversations"].contains(&arg.as_str()) {
-                        String::new()
-                    } else {
-                        iter.next()
-                            .ok_or_else(|| invalid(format!("Missing value for {arg}")))?
-                    };
+                let value = if [
+                    "--help",
+                    "--read-only",
+                    "--no-conversations",
+                    "--revoke-credentials",
+                ]
+                .contains(&arg.as_str())
+                {
+                    String::new()
+                } else {
+                    iter.next()
+                        .ok_or_else(|| invalid(format!("Missing value for {arg}")))?
+                };
                 if options.insert(arg, value).is_some() {
                     return Err(invalid("Repeated option"));
                 }
@@ -161,6 +171,46 @@ fn input(s: &str) -> Result<Json> {
     };
     Ok(parse(&s)?)
 }
+fn seed_demo(store: &mut Store) -> Result<()> {
+    let path = store
+        .root
+        .join(format!(".pending-demo-{}", digest::random()?));
+    let records = "{\"role\":\"user\",\"content\":\"What did we decide about the synthetic garden?\"}\n{\"role\":\"assistant\",\"content\":\"We will plant native flowers in spring and record the results.\"}\n";
+    private_file(&path, records.as_bytes())?;
+    let imported = evidence::import(&store.root, &path, "Synthetic garden decision", &object([]));
+    fs::remove_file(&path)?;
+    let trace = imported?;
+    let mut welcome = markdown::from_markdown(
+        "start-here",
+        "# Try your wiki\n\nThis is a synthetic example, not real personal knowledge. Read [[garden-plan|the garden plan]], follow its verified source, then edit and preview this page. Save a change and inspect History.\n",
+    )?;
+    welcome.insert("title", "Start here: a complete workflow".into());
+    let mut plan = markdown::from_markdown(
+        "garden-plan",
+        "# Garden plan\n\nPlant native flowers in spring. Return to [[start-here|the walkthrough]].\n\n| Decision | Related page |\n| --- | --- |\n| Keep a record | [[start-here|Walkthrough]] |\n",
+    )?;
+    plan.insert(
+        "evidence",
+        vec![object([
+            ("conversation", trace.get("id").clone()),
+            ("event", "line-2".into()),
+            (
+                "quote",
+                "We will plant native flowers in spring and record the results.".into(),
+            ),
+        ])]
+        .into(),
+    );
+    store.save(
+        "operator",
+        "Synthetic example",
+        &object([
+            ("operation_id", "initial-demo".into()),
+            ("updates", vec![welcome, plan].into()),
+        ]),
+    )?;
+    Ok(())
+}
 fn main() {
     if let Err(e) = run() {
         eprintln!("{}", e.json().encode());
@@ -178,14 +228,14 @@ fn run() -> Result<()> {
         return Ok(());
     }
     match args.command.as_str() {
-        "init" => {
+        "init" | "demo" => {
             args.check(&["--data", "--token-file"], 0)?;
             let file = token_path(&args)?;
             let root = Path::new(args.required("--data")?);
             Store::init(root)?;
-            let _store = Store::open(root)?;
+            let mut store = Store::open(root)?;
             let mut auth = Auth::open(root)?;
-            output(issue(
+            let credential = issue(
                 &mut auth,
                 "Operator",
                 "manager",
@@ -196,7 +246,11 @@ fn run() -> Result<()> {
                     "manage".into(),
                 ],
                 &file,
-            )?);
+            )?;
+            if args.command == "demo" {
+                seed_demo(&mut store)?;
+            }
+            output(credential);
         }
         "serve" => {
             args.check(
@@ -368,18 +422,26 @@ fn run() -> Result<()> {
         "backup" => {
             args.check(&["--data", "--to"], 0)?;
             let store = Store::open(Path::new(args.required("--data")?))?;
+            evidence::verify_all(&store.root, true)?;
+            Auth::open(&store.root)?;
             store.backup(Path::new(args.required("--to")?))?;
             output(object([("backup", args.required("--to")?.into())]));
         }
         "restore" => {
-            args.check(&["--data", "--from", "--token-file"], 0)?;
+            args.check(
+                &["--data", "--from", "--token-file", "--revoke-credentials"],
+                0,
+            )?;
             let file = token_path(&args)?;
             let root = Path::new(args.required("--data")?);
             let original = Store::open(Path::new(args.required("--from")?))?;
+            evidence::verify_all(&original.root, true)?;
+            Auth::open(&original.root)?;
             original.backup(root)?;
+            evidence::verify_all(root, true)?;
             let _restored = Store::open(root)?;
             let mut auth = Auth::open(root)?;
-            auth.reset_after_restore()?;
+            auth.reset_after_restore(args.options.contains_key("--revoke-credentials"))?;
             output(issue(
                 &mut auth,
                 "Restored operator",
@@ -396,11 +458,6 @@ fn run() -> Result<()> {
         "import" => {
             args.check(&["--data", "--directory"], 0)?;
             let mut store = Store::open(Path::new(args.required("--data")?))?;
-            if !store.history.is_empty() {
-                return Err(invalid(
-                    "Import requires an empty store and never merges or overwrites existing history",
-                ));
-            }
             let directory = Path::new(args.required("--directory")?);
             let mut updates = Vec::new();
             let mut entries =
@@ -425,16 +482,34 @@ fn run() -> Result<()> {
             for u in &updates {
                 store::validate_update(u)?;
             }
+            let plan = digest::sha256(Json::from(updates.clone()).encode().as_bytes());
+            let plan_path = store.root.join("import.json");
+            if plan_path.exists() {
+                if store::load_json(&plan_path)?.get("digest").s() != plan {
+                    return Err(invalid(
+                        "An import already owns this store; resume with the identical Markdown collection",
+                    ));
+                }
+            } else {
+                if !store.history.is_empty() {
+                    return Err(invalid(
+                        "Import requires an empty store or its own interrupted import",
+                    ));
+                }
+                store::atomic(
+                    &plan_path,
+                    object([("digest", plan.clone().into())])
+                        .encode()
+                        .as_bytes(),
+                )?;
+            }
             let mut receipts = Vec::new();
             for (i, batch) in updates.chunks(10).enumerate() {
                 receipts.push(store.save(
                     "operator",
                     "Filesystem operator",
                     &object([
-                        (
-                            "operation_id",
-                            format!("import-{}-{i}", digest::random()?).into(),
-                        ),
+                        ("operation_id", format!("import-{plan}-{i}").into()),
                         ("updates", batch.to_vec().into()),
                     ]),
                 )?);
@@ -451,7 +526,7 @@ fn run() -> Result<()> {
             let dest = Path::new(args.required("--directory")?);
             fs::create_dir(dest)?;
             fs::set_permissions(dest, fs::Permissions::from_mode(0o700))?;
-            for (id, page) in &store.pages {
+            for (id, page) in store.pages.iter() {
                 private_file(
                     &dest.join(format!("{id}.md")),
                     markdown::to_markdown(page).as_bytes(),
@@ -460,12 +535,31 @@ fn run() -> Result<()> {
             output(object([("exported", store.pages.len().into())]));
         }
         "import-trace" => {
-            args.check(&["--data", "--file", "--title"], 0)?;
+            args.check(&["--data", "--file", "--title", "--session", "--parent"], 0)?;
+            let mut provenance = object([]);
+            for (flag, field) in [("--session", "session"), ("--parent", "parent")] {
+                if let Some(value) = args.options.get(flag) {
+                    provenance.insert(field, value.clone().into());
+                }
+            }
             let store = Store::open(Path::new(args.required("--data")?))?;
             output(evidence::import(
                 &store.root,
                 Path::new(args.required("--file")?),
                 args.required("--title")?,
+                &provenance,
+            )?);
+        }
+        "capture-file" => {
+            args.check(&["--data", "--trace", "--line", "--file"], 0)?;
+            let store = Store::open(Path::new(args.required("--data")?))?;
+            output(evidence::attach(
+                &store.root,
+                args.required("--trace")?,
+                args.required("--line")?
+                    .parse()
+                    .map_err(|_| invalid("Invalid physical line"))?,
+                Path::new(args.required("--file")?),
             )?);
         }
         "publish-media" => {
@@ -481,47 +575,13 @@ fn run() -> Result<()> {
             args.check(&["--data"], 0)?;
             let root = Path::new(args.required("--data")?);
             let app = App::open(root, true, true)?;
-            let mut traces = 0usize;
-            let mut media = 0usize;
-            for trace in evidence::catalog(&app.store.root)? {
-                let snapshot = trace.get("snapshot").s();
-                if !store::hash_id(snapshot) {
-                    return Err(invalid("Invalid trace metadata"));
-                }
-                let mut f = fs::File::open(
-                    app.store
-                        .root
-                        .join("traces")
-                        .join(format!("{snapshot}.jsonl")),
-                )?;
-                let mut buffer = [0; 65536];
-                let mut hash = digest::Sha256::new();
-                loop {
-                    let n = f.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hash.update(&buffer[..n]);
-                }
-                if digest::hex(&hash.finish()) != snapshot {
-                    return Err(invalid("Trace checksum mismatch"));
-                }
-                traces += 1;
-            }
-            for entry in fs::read_dir(app.store.root.join("media"))? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|s| s == "json") {
-                    let meta = store::load_json(&path)?;
-                    evidence::media(&app.store.root, meta.get("file").s())?;
-                    media += 1;
-                }
-            }
+            let verified = evidence::verify_all(&app.store.root, true)?;
             output(object([
                 ("verified", true.into()),
                 ("head", app.store.head.into()),
                 ("articles", app.store.pages.len().into()),
-                ("traces", traces.into()),
-                ("media", media.into()),
+                ("traces", verified.get("traces").clone()),
+                ("media", verified.get("media").clone()),
             ]));
         }
         _ => return Err(invalid("Unknown command; use --help")),
